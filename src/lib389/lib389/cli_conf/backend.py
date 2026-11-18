@@ -7,6 +7,10 @@
 # See LICENSE for details.
 # --- END COPYRIGHT BLOCK ---
 
+from datetime import datetime, timezone
+
+from ldap import LDAPError
+
 from lib389.backend import Backend, Backends, DatabaseConfig, BackendSuffixView, is_subsuffix_of
 from lib389.configurations.sample import (
     create_base_domain,
@@ -16,7 +20,7 @@ from lib389.configurations.sample import (
     create_base_c,
     )
 from lib389.chaining import (ChainingLinks)
-from lib389.monitor import MonitorLDBM
+from lib389.monitor import MonitorDiskSpace, MonitorLDBM
 from lib389.replica import Replicas
 from lib389.utils import ensure_str, is_a_dn, is_dn_parent, parse_size, align_to_page_size
 from lib389.tasks import DBCompactTask
@@ -861,15 +865,37 @@ def backend_reindex_vlv(inst, basedn, log, args):
     log.info("Successfully reindexed VLV indexes")
 
 
+def _compact_disk_snapshot(inst):
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        disks = MonitorDiskSpace(inst).get_disks()
+    except LDAPError as error:
+        return timestamp, [f"Disk-space data unavailable ({error})"]
+    return timestamp, disks or ["No disk-space data returned by the server"]
+
+
 def backend_compact(inst, basedn, log, args):
     task = DBCompactTask(inst)
     task_properties = {}
     if args.only_changelog:
         task_properties = {'justChangelog': 'yes'}
+    report_disk_space = getattr(args, "report_disk_space", False)
+    if report_disk_space:
+        baseline_time, baseline_disks = _compact_disk_snapshot(inst)
+
     task.create(properties=task_properties)
     log.info(f"Started database compaction task {task.dn}")
+    if report_disk_space:
+        for disk in baseline_disks:
+            log.info(f"{baseline_time} {task.dn} before submission: {disk}")
+
     task.wait(timeout=args.timeout)
     result = task.get_exit_code()
+    if report_disk_space:
+        timestamp, disks = _compact_disk_snapshot(inst)
+        phase = "wait ended" if result is None else "task completed"
+        for disk in disks:
+            log.info(f"{timestamp} {task.dn} {phase}: {disk}")
     if result is None:
         raise ValueError(
             f"Database compaction task {task.dn} has an unknown outcome (exit code unavailable). "
@@ -1247,5 +1273,9 @@ def create_parser(subparsers):
     compact_parser = subcommands.add_parser('compact-db', help='Compact the database and the replication changelog', formatter_class=CustomHelpFormatter)
     compact_parser.set_defaults(func=backend_compact)
     compact_parser.add_argument('--only-changelog', action='store_true', help='Compacts only the replication change log')
+    compact_parser.add_argument(
+        '--report-disk-space', action='store_true',
+        help='Report server filesystem usage before compaction and after waiting',
+    )
     compact_parser.add_argument('--timeout', default=0, type=int,
                                 help="Set a timeout to wait for the compaction task.  Default is 0 (no timeout)")
